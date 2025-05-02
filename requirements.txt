@@ -1,0 +1,4 @@
+selenium>=4.0.0
+webdriver-manager>=4.0.0
+# requests is usually installed as a dependency, but good to list
+requests 

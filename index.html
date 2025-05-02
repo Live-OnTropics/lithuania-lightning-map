@@ -1,41 +1,378 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en-GB">
 <head>
-    <meta charset="UTF-8">
+    <meta charset="utf-8">
+    <title>Lithuania Lightning Map (Last Hour)⚡</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>The Sword of Glory</title>
-    <link rel="stylesheet" href="css/reset.css">
-    <link rel="stylesheet" href="css/main.css">
-    <link rel="stylesheet" href="css/sidebar.css">
-    <link rel="stylesheet" href="css/map.css">
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <!-- Turf.js for Nowcasting -->
+    <script src='https://unpkg.com/@turf/turf@6/turf.min.js'></script>
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+
+    <style>
+        body { font-family: 'Inter', sans-serif; margin: 0; padding: 0; display: flex; flex-direction: column; height: 100vh; }
+        #map { height: 100%; width: 100%; z-index: 1; }
+        .info-panel { background: rgba(255, 255, 255, 0.85); padding: 5px 10px; border-radius: 5px; box-shadow: 0 1px 5px rgba(0,0,0,0.2); position: absolute; top: 10px; left: 50px; z-index: 1000; font-size: 0.8em; }
+        .legend { background: rgba(255,255,255,0.85); padding: 8px; border-radius: 6px; box-shadow: 0 1px 5px rgba(0,0,0,0.2); position: absolute; bottom: 30px; right: 10px; z-index: 1000; font-size: 0.75em; max-width: 180px; }
+        .legend h4 { margin: 0 0 6px; font-weight: 600; font-size: 0.85em; }
+        .legend div { display: flex; align-items: center; margin-bottom: 3px; }
+        .color-box { width: 14px; height: 14px; margin-right: 6px; border-radius: 3px; border: 1px solid #ccc; }
+        /* Nowcast Styles */
+        .nowcast-cluster { /* Style via JS options */ }
+        .nowcast-cone { /* Style via JS options */ }
+    </style>
 </head>
 <body>
-    <div id="game-container">
-        <div id="sidebar">
-            <h2>The Sword of Glory</h2>
-            <div id="resources">
-                <p>Oil: <span id="resource-oil">0</span></p>
-                <p>Steel: <span id="resource-steel">0</span></p>
-                <p>Food: <span id="resource-food">0</span></p>
-                <p>Manpower: <span id="resource-manpower">0</span></p>
-                <p>Gold: <span id="resource-gold">0</span></p>
-                <p>Energy: <span id="resource-energy">0</span></p>
-            </div>
-            <div id="controls">
-                <button id="create-unit">Create Unit</button>
-                <button id="zoom-in">Zoom In</button>
-                <button id="zoom-out">Zoom Out</button>
-                <button id="reset-view">Reset View</button>
-                <button id="build-factory">Build Factory</button>
-                <button id="build-base">Build Military Base</button>
-            </div>
-        </div>
-        <canvas id="game-map"></canvas>
+    <div id="map"></div>
+    <div class="info-panel">
+        <div id="status">Loading...</div>
+        <div id="last-updated"></div>
     </div>
+    <div id="legend" class="legend" style="display: none;"></div>
 
-    <script src="js/map.js"></script>
-    <script src="js/ui.js"></script>
-    <script src="js/resources.js"></script>
-    <script src="js/game.js"></script>
+    <script>
+        // --- Configuration ---
+        const MAP_CENTER = [55.17, 23.88]; // Lithuania Center (Lat, Lng)
+        const MAP_ZOOM = 7;
+        const DATA_URL = "strikes.json"; // Path to your local data file
+        const REFRESH_INTERVAL_MS = 20 * 1000; // How often to fetch data (e.g., 20 seconds)
+        const STRIKE_MAX_AGE_MS = 60 * 60 * 1000; // Keep strikes younger than 1 hour
+
+        // Nowcast Parameters (adjust as needed)
+        const NOWCAST_CONF = {
+            MAX_CLUSTER_DIST_KM: 40, MIN_CLUSTER_SIZE: 5, MAX_TIME_RANGE_MS: 1 * 60 * 60 * 1000,
+            TIME_BIN_MS: 5 * 60 * 1000, INACTIVITY_THRESHOLD_MS: 20 * 60 * 1000,
+            DECAY_CONSTANT: 1.5, RANSAC_ITERATIONS: 50, RANSAC_THRESHOLD_DEG: 0.05,
+            MIN_BINS_FOR_MOTION: 2, SMOOTHING_NEIGHBOR_DIST_KM: 150
+        };
+
+        // --- Map Initialization ---
+        const map = L.map('map').setView(MAP_CENTER, MAP_ZOOM);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 18,
+            attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }).addTo(map);
+
+        // Layer groups for managing markers/shapes
+        const strikeLayer = L.layerGroup().addTo(map);
+        const nowcastLayer = L.layerGroup().addTo(map);
+
+        // Status elements
+        const statusElement = document.getElementById('status');
+        const lastUpdatedElement = document.getElementById('last-updated');
+        const legendElement = document.getElementById('legend');
+
+        let strikeDataCache = []; // Store the last fetched data
+
+        // --- Data Fetching and Processing ---
+        async function fetchDataAndUpdateMap() {
+            statusElement.textContent = "Fetching data...";
+            try {
+                // Add cache buster to prevent browser caching of the JSON file
+                const response = await fetch(`${DATA_URL}?t=${Date.now()}`);
+                if (!response.ok) {
+                    throw new Error(`HTTP error! Status: ${response.status}`);
+                }
+                strikeDataCache = await response.json(); // Update cache
+                if (!Array.isArray(strikeDataCache)) {
+                     throw new Error("Fetched data is not an array.");
+                }
+                statusElement.textContent = "Processing data...";
+                updateMapDisplay(); // Process cached data
+                lastUpdatedElement.textContent = `Map updated: ${new Date().toLocaleTimeString()}`;
+            } catch (error) {
+                console.error("Error fetching or processing data:", error);
+                statusElement.textContent = `Error loading data: ${error.message}`;
+                // Optionally clear the map or show cached data if available
+                // updateMapDisplay(); // Try updating with old cache?
+            }
+        }
+
+        // --- Map Display Update ---
+        function updateMapDisplay() {
+            strikeLayer.clearLayers();
+            nowcastLayer.clearLayers();
+
+            const now = Date.now();
+            const cutoffTime = now - STRIKE_MAX_AGE_MS;
+            let lastStrikeTime = 0;
+
+            // 1. Filter strikes for the last hour
+            const filteredStrikes = strikeDataCache.filter(s => {
+                try {
+                    const strikeTime = parseISOTime(s.time).getTime();
+                    if (strikeTime >= cutoffTime) {
+                         if (strikeTime > lastStrikeTime) lastStrikeTime = strikeTime;
+                         return true;
+                    }
+                    return false;
+                } catch (e) {
+                    return false; // Skip if time parsing fails
+                }
+            });
+
+             statusElement.textContent = `Displaying ${filteredStrikes.length} strikes (last hour)`;
+             if (lastStrikeTime > 0) {
+                 statusElement.textContent += ` | Latest: ${new Date(lastStrikeTime).toLocaleTimeString()}`;
+             }
+
+            // 2. Render filtered strikes
+            const colorModeEnabled = true; // Always color by age for last hour view
+            filteredStrikes.forEach(s => {
+                const strikeTime = parseISOTime(s.time).getTime();
+                const ageMillis = now - strikeTime;
+                const ageFraction = Math.min(1, ageMillis / STRIKE_MAX_AGE_MS);
+                const color = getColorFromAge(ageFraction);
+
+                L.circleMarker([s.lat, s.lon], {
+                    radius: 4, color: color, fillColor: color, fillOpacity: 0.8, weight: 1
+                }).bindPopup(`Time: ${new Date(strikeTime).toLocaleString()}<br>Coords: ${s.lat.toFixed(4)}, ${s.lon.toFixed(4)}`)
+                  .addTo(strikeLayer);
+            });
+
+            // 3. Calculate and Render Nowcast
+            const nowcastResults = calculateLightningNowcast(filteredStrikes, new Date(now), NOWCAST_CONF);
+            renderNowcast2D(nowcastResults);
+            updateLegend(nowcastResults.length > 0); // Update legend based on whether nowcast is active
+        }
+
+        // --- Helper: Parse ISO Time String ---
+         function parseISOTime(isoString) {
+             // Basic parsing, assumes UTC 'Z' or no offset
+             return new Date(isoString);
+         }
+
+         // --- Helper: Get Color from Age Fraction (0=newest, 1=oldest) ---
+         function getColorFromAge(fraction) {
+             if (fraction < 0.15) return '#ffd700'; // ~9 mins
+             if (fraction < 0.30) return '#ff69b4'; // ~18 mins
+             if (fraction < 0.50) return '#ff00ff'; // ~30 mins
+             if (fraction < 0.75) return '#800080'; // ~45 mins
+             return '#4b0082'; // > 45 mins
+         }
+
+
+        // --- Nowcasting Logic (adapted from previous examples) ---
+        function calculateLightningNowcast(lightningData, referenceTime, config) {
+            const refTimeMs = referenceTime.getTime();
+            if (!lightningData || lightningData.length < config.MIN_CLUSTER_SIZE) return [];
+
+            // Convert internal format (lat, lon, time string) to format expected by calc functions if needed
+            const dataForCalc = lightningData.map(s => ({
+                coordinates: [s.lon, s.lat], // Lon, Lat for Turf
+                time: parseISOTime(s.time) // Date object
+            })).filter(s => s.time); // Filter out any failed parses
+
+            // --- 1. Initial Clustering ---
+            const clusters = [];
+            const usedIndices = new Set();
+            const sortedData = dataForCalc.sort((a, b) => a.time - b.time);
+
+            for (let i = 0; i < sortedData.length; i++) {
+                if (usedIndices.has(i)) continue;
+                const currentCluster = [sortedData[i]];
+                usedIndices.add(i);
+                const queue = [i];
+                while (queue.length > 0) {
+                    const currentIndex = queue.shift();
+                    const currentStrike = sortedData[currentIndex];
+                    for (let j = currentIndex + 1; j < sortedData.length; j++) {
+                        if (usedIndices.has(j)) continue;
+                        const nextStrike = sortedData[j];
+                        if (nextStrike.time.getTime() - currentStrike.time.getTime() > config.MAX_TIME_RANGE_MS) break;
+                        const distKm = turf.distance(turf.point(currentStrike.coordinates), turf.point(nextStrike.coordinates), { units: 'kilometers' });
+                        if (distKm <= config.MAX_CLUSTER_DIST_KM) {
+                            currentCluster.push(nextStrike); usedIndices.add(j); queue.push(j);
+                        } } }
+                if (currentCluster.length >= config.MIN_CLUSTER_SIZE) {
+                     const times = currentCluster.map(s => s.time.getTime());
+                     if (Math.max(...times) - Math.min(...times) > 60000) { // Min 1 min duration
+                         clusters.push(currentCluster);
+                     }
+                }
+            }
+
+            // --- 2. Process Each Cluster ---
+            const clusterInfos = [];
+            clusters.forEach((cluster) => {
+                const times = cluster.map(s => s.time.getTime());
+                const minTime = Math.min(...times); const maxTime = Math.max(...times);
+                if (refTimeMs - maxTime > config.INACTIVITY_THRESHOLD_MS) return; // Skip inactive
+
+                const bins = [];
+                for (let t = minTime; t <= maxTime; t += config.TIME_BIN_MS) {
+                    const binStrikes = cluster.filter(s => s.time.getTime() >= t && s.time.getTime() < (t + config.TIME_BIN_MS));
+                    if (binStrikes.length > 0) {
+                        let sumLat = 0, sumLon = 0, sumWeight = 0;
+                        const clusterDuration = maxTime - minTime;
+                        binStrikes.forEach(s => {
+                            const weight = clusterDuration > 0 ? Math.exp(-config.DECAY_CONSTANT * (maxTime - s.time.getTime()) / clusterDuration) : 1;
+                            sumLat += s.coordinates[1] * weight; sumLon += s.coordinates[0] * weight; sumWeight += weight; });
+                        if (sumWeight > 0) bins.push({ time: t + config.TIME_BIN_MS / 2, lat: sumLat / sumWeight, lon: sumLon / sumWeight });
+                    } }
+                if (bins.length === 0) return;
+                bins.sort((a, b) => a.time - b.time);
+
+                let speedKmH = 0, directionDeg = 0, regressionScore = 0;
+                const baseLat = bins[bins.length - 1].lat; const baseLon = bins[bins.length - 1].lon;
+
+                if (bins.length >= config.MIN_BINS_FOR_MOTION) {
+                    const model = ransacLinearRegression(bins, config.RANSAC_ITERATIONS, config.RANSAC_THRESHOLD_DEG);
+                    const speedLatDegPerSec = model.slopeLat; const speedLonDegPerSec = model.slopeLon;
+                    regressionScore = model.r2;
+                    const avgLatRad = (bins.reduce((sum, b) => sum + b.lat, 0) / bins.length) * Math.PI / 180;
+                    const latFactor = Math.cos(avgLatRad);
+                    const speedLatKmH = speedLatDegPerSec * 111.32 * 3600;
+                    const speedLonKmH = speedLonDegPerSec * 111.32 * latFactor * 3600;
+                    speedKmH = Math.min(200, Math.sqrt(speedLatKmH**2 + speedLonKmH**2)); // Cap speed
+                    if (speedKmH > 0.1) directionDeg = (Math.atan2(speedLonKmH, speedLatKmH) * 180 / Math.PI + 360) % 360;
+                }
+
+                const sizeScore = Math.min(cluster.length / 50, 1);
+                const durationScore = Math.min((maxTime - minTime) / config.MAX_TIME_RANGE_MS, 1);
+                const velocityScore = Math.min(speedKmH / 100, 1);
+                const confidenceScore = Math.max(0.1, (sizeScore*0.3 + durationScore*0.3 + regressionScore*0.2 + velocityScore*0.2));
+
+                clusterInfos.push({ baseLat, baseLon, speedKmH, directionDeg, confidenceScore });
+            });
+
+            // --- 3. Optional Smoothing ---
+             const smoothedClusters = clusterInfos.map((currentCluster, index) => {
+                 let weightedSpeedSum = currentCluster.speedKmH * currentCluster.confidenceScore * 2; 
+                 let weightedSinSum = Math.sin(currentCluster.directionDeg * Math.PI/180) * currentCluster.speedKmH * currentCluster.confidenceScore * 2;
+                 let weightedCosSum = Math.cos(currentCluster.directionDeg * Math.PI/180) * currentCluster.speedKmH * currentCluster.confidenceScore * 2;
+                 let totalWeight = currentCluster.confidenceScore * 2;
+
+                 clusterInfos.forEach((otherCluster, otherIndex) => {
+                     if (index === otherIndex) return; 
+                     const distKm = turf.distance([currentCluster.baseLon, currentCluster.baseLat], [otherCluster.baseLon, otherCluster.baseLat], {units: 'kilometers'});
+                     if (distKm < config.SMOOTHING_NEIGHBOR_DIST_KM) {
+                         const weight = otherCluster.confidenceScore / (distKm / 50 + 1); 
+                         weightedSpeedSum += otherCluster.speedKmH * weight;
+                         weightedSinSum += Math.sin(otherCluster.directionDeg * Math.PI/180) * otherCluster.speedKmH * weight;
+                         weightedCosSum += Math.cos(otherCluster.directionDeg * Math.PI/180) * otherCluster.speedKmH * weight;
+                         totalWeight += weight;
+                     } });
+
+                 let smoothedSpeedKmH = currentCluster.speedKmH;
+                 let smoothedDirectionDeg = currentCluster.directionDeg;
+                 if (totalWeight > 0.01) {
+                     smoothedSpeedKmH = Math.min(200, weightedSpeedSum / totalWeight); // Average speed magnitude
+                     const avgSpeedX = weightedSinSum / totalWeight;
+                     const avgSpeedY = weightedCosSum / totalWeight;
+                     if (Math.abs(avgSpeedX) > 0.01 || Math.abs(avgSpeedY) > 0.01) {
+                        smoothedDirectionDeg = (Math.atan2(avgSpeedX, avgSpeedY) * 180 / Math.PI + 360) % 360;
+                     }
+                 }
+                 return { ...currentCluster, speedKmH: smoothedSpeedKmH, directionDeg: smoothedDirectionDeg };
+             });
+
+            return smoothedClusters; // Return potentially smoothed results
+        }
+
+        function ransacLinearRegression(bins, iterations, thresholdDeg) {
+             let bestModel = { slopeLat: 0, slopeLon: 0, interceptLat: bins[0].lat, interceptLon: bins[0].lon, r2: 0 };
+             let maxInliers = 0; const baseTime = bins[0].time;
+             if (bins.length < 2) return bestModel;
+
+             for (let i = 0; i < iterations; i++) {
+                 let idx1 = Math.floor(Math.random() * bins.length); let idx2 = idx1;
+                 while (idx2 === idx1) idx2 = Math.floor(Math.random() * bins.length);
+                 const sample = [bins[idx1], bins[idx2]];
+                 const model = fitWeightedLinearModel(sample, baseTime, 1);
+                 const inliers = bins.filter(b => {
+                     const tSec = (b.time - baseTime) / 1000;
+                     const predLat = model.interceptLat + model.slopeLat * tSec; const predLon = model.interceptLon + model.slopeLon * tSec;
+                     return Math.abs(b.lat - predLat) < thresholdDeg && Math.abs(b.lon - predLon) < thresholdDeg; });
+                 if (inliers.length > maxInliers) {
+                     maxInliers = inliers.length;
+                     bestModel = (inliers.length >= 2) ? fitWeightedLinearModel(inliers, baseTime, 1.5) : model;
+                 } }
+             if (maxInliers >= 2) bestModel.r2 = calculateRsquared(bins, bestModel, baseTime);
+             return bestModel;
+        }
+
+        function fitWeightedLinearModel(points, baseTime, decay) {
+            let sumT=0, sumLat=0, sumLon=0, sumTLat=0, sumTLon=0, sumT2=0, sumWeight=0;
+            const n = points.length; if (n === 0) return { slopeLat: 0, slopeLon: 0, interceptLat: 0, interceptLon: 0 };
+            const times = points.map(p => p.time); const maxTime = Math.max(...times); const timeSpan = maxTime - Math.min(...times);
+            points.forEach(p => {
+                const tSec = (p.time - baseTime) / 1000; const weight = timeSpan > 0 ? Math.exp(-decay * (maxTime - p.time) / timeSpan) : 1;
+                sumT += tSec * weight; sumLat += p.lat * weight; sumLon += p.lon * weight; sumTLat += tSec * p.lat * weight; sumTLon += tSec * p.lon * weight; sumT2 += tSec * tSec * weight; sumWeight += weight; });
+            if (sumWeight <= 0) return { slopeLat: 0, slopeLon: 0, interceptLat: points[0].lat, interceptLon: points[0].lon };
+            const denom = sumT2 * sumWeight - sumT * sumT;
+            const slopeLat = denom ? (sumTLat * sumWeight - sumT * sumLat) / denom : 0; const slopeLon = denom ? (sumTLon * sumWeight - sumT * sumLon) / denom : 0;
+            const interceptLat = (sumLat - slopeLat * sumT) / sumWeight; const interceptLon = (sumLon - slopeLon * sumT) / sumWeight;
+            return { slopeLat, slopeLon, interceptLat, interceptLon };
+        }
+
+         function calculateRsquared(allPoints, model, baseTime) {
+             if (allPoints.length < 2) return 0;
+             let ssTotLat = 0, ssResLat = 0, ssTotLon = 0, ssResLon = 0;
+             const meanLat = allPoints.reduce((s, p) => s + p.lat, 0) / allPoints.length; const meanLon = allPoints.reduce((s, p) => s + p.lon, 0) / allPoints.length;
+             allPoints.forEach(p => {
+                 const tSec = (p.time - baseTime) / 1000; const predLat = model.interceptLat + model.slopeLat * tSec; const predLon = model.interceptLon + model.slopeLon * tSec;
+                 ssTotLat += (p.lat - meanLat)**2; ssResLat += (p.lat - predLat)**2; ssTotLon += (p.lon - meanLon)**2; ssResLon += (p.lon - predLon)**2; });
+             const r2Lat = ssTotLat > 0 ? Math.max(0, 1 - ssResLat / ssTotLat) : 1; const r2Lon = ssTotLon > 0 ? Math.max(0, 1 - ssResLon / ssTotLon) : 1;
+             return (r2Lat + r2Lon) / 2; // Average R^2
+         }
+
+
+        // --- Nowcast Rendering ---
+        function renderNowcast2D(nowcasts) {
+            nowcastLayer.clearLayers(); // Clear previous shapes
+            nowcasts.forEach((cluster, index) => {
+                const confidenceColor = cluster.confidenceScore > 0.8 ? '#ff0000' : cluster.confidenceScore > 0.6 ? '#ffa500' : '#ffff00'; // Red/Orange/Yellow
+                const radiusKm = Math.max(5, cluster.confidenceScore * 15);
+                const coneRadiusKm = Math.max(10, cluster.confidenceScore * 40);
+                const coneWidthDegrees = 30;
+
+                // Circle
+                L.circle([cluster.baseLat, cluster.baseLon], {
+                    radius: radiusKm * 1000, color: confidenceColor, fillColor: confidenceColor, fillOpacity: 0.4, weight: 2, className: 'nowcast-cluster'
+                }).bindPopup(`<b>Nowcast Cluster ${index + 1}</b><br>Confidence: ${(cluster.confidenceScore * 100).toFixed(0)}%<br>Speed: ${cluster.speedKmH.toFixed(0)} km/h @ ${cluster.directionDeg.toFixed(0)}°`)
+                  .addTo(nowcastLayer);
+
+                // Cone
+                if (cluster.speedKmH > 1) {
+                    try {
+                         const cone = turf.sector([cluster.baseLon, cluster.baseLat], coneRadiusKm, cluster.directionDeg - (coneWidthDegrees / 2), cluster.directionDeg + (coneWidthDegrees / 2), { units: 'kilometers' });
+                         L.geoJSON(cone, {
+                             style: { color: confidenceColor, fillColor: confidenceColor, fillOpacity: 0.3, weight: 1, dashArray: '5, 5', className: 'nowcast-cone' }
+                         }).addTo(nowcastLayer);
+                    } catch (e) { console.error("Error creating Turf sector:", e)}
+                }
+            });
+        }
+
+         // --- Legend Update ---
+         function updateLegend(nowcastActive) {
+             let content = '<h4>Legend</h4>';
+             // Strike Age
+             content += '<div><div class="color-box" style="background: #ffd700"></div>~0-9 min ago</div>';
+             content += '<div><div class="color-box" style="background: #ff69b4"></div>~10-18 min ago</div>';
+             content += '<div><div class="color-box" style="background: #ff00ff"></div>~19-30 min ago</div>';
+             content += '<div><div class="color-box" style="background: #800080"></div>~31-45 min ago</div>';
+             content += '<div><div class="color-box" style="background: #4b0082"></div>~46-60 min ago</div>';
+
+             if (nowcastActive) {
+                 content += '<h4 style="margin-top: 8px;">Nowcast Confidence</h4>';
+                 content += '<div><div class="color-box" style="background: #ff0000"></div>High (>80%)</div>';
+                 content += '<div><div class="color-box" style="background: #ffa500"></div>Moderate (60-80%)</div>';
+                 content += '<div><div class="color-box" style="background: #ffff00"></div>Low (<60%)</div>';
+             }
+             legendElement.innerHTML = content;
+             legendElement.style.display = 'block';
+         }
+
+        // --- Initial Load and Interval ---
+        fetchDataAndUpdateMap(); // Initial load
+        setInterval(fetchDataAndUpdateMap, REFRESH_INTERVAL_MS); // Set refresh interval
+
+    </script>
 </body>
 </html>
